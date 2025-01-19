@@ -64,6 +64,10 @@ where
         }
     }
 
+    pub fn extended_pbs_configs(&self) -> Vec<(&PbsConfig, &[RelayClient])> {
+        todo!()
+    }
+
     pub fn has_monitors(&self) -> bool {
         !self.config.pbs_config.relay_monitors.is_empty()
     }

@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -10,6 +11,7 @@ use alloy::{
 };
 use axum::http::{HeaderMap, HeaderValue};
 use cb_common::{
+    config::PbsConfig,
     constants::APPLICATION_BUILDER_DOMAIN,
     pbs::{
         error::{PbsError, ValidationError},
@@ -50,48 +52,33 @@ pub async fn get_header<S: BuilderApiState>(
         }
     }
 
-    let ms_into_slot = ms_into_slot(params.slot, state.config.chain);
     let (pbs_config, relays, maybe_mux_id) = state.mux_config_and_relays(&params.pubkey);
-
-    if let Some(mux_id) = maybe_mux_id {
-        debug!(mux_id, relays = relays.len(), pubkey = %params.pubkey, "using mux config");
-    } else {
-        debug!(relays = relays.len(), pubkey = %params.pubkey, "using default config");
-    }
-
-    let max_timeout_ms = pbs_config
-        .timeout_get_header_ms
-        .min(pbs_config.late_in_slot_time_ms.saturating_sub(ms_into_slot));
-
-    if max_timeout_ms == 0 {
-        warn!(
-            ms_into_slot,
-            threshold = pbs_config.late_in_slot_time_ms,
-            "late in slot, skipping relay requests"
-        );
-
-        return Ok(None);
-    }
 
     // prepare headers, except for start time which is set in `send_one_get_header`
     let mut send_headers = HeaderMap::new();
     send_headers.insert(USER_AGENT, get_user_agent_with_version(&req_headers)?);
 
-    let mut handles = Vec::with_capacity(relays.len());
-    for relay in relays.iter() {
-        handles.push(send_timed_get_header(
+    let mut handles = Vec::new();
+
+    handles.append(&mut prepare_tasks(
+        params,
+        &state,
+        parent_block.clone(),
+        pbs_config,
+        relays,
+        maybe_mux_id,
+        send_headers.clone(),
+    ));
+
+    for (pbs_config, relays) in state.extended_pbs_configs() {
+        handles.append(&mut prepare_tasks(
             params,
-            relay.clone(),
-            state.config.chain,
+            &state,
+            parent_block.clone(),
+            pbs_config,
+            relays,
+            None,
             send_headers.clone(),
-            ms_into_slot,
-            max_timeout_ms,
-            ValidationContext {
-                skip_sigverify: state.pbs_config().skip_sigverify,
-                min_bid_wei: state.pbs_config().min_bid_wei,
-                extra_validation_enabled: state.extra_validation_enabled(),
-                parent_block: parent_block.clone(),
-            },
         ));
     }
 
@@ -118,6 +105,58 @@ pub async fn get_header<S: BuilderApiState>(
     let max_bid = relay_bids.into_iter().max_by_key(|bid| bid.value());
 
     Ok(max_bid)
+}
+
+pub fn prepare_tasks<S: BuilderApiState>(
+    params: GetHeaderParams,
+    state: &PbsState<S>,
+    parent_block: Arc<RwLock<Option<Block>>>,
+    pbs_config: &PbsConfig,
+    relays: &[RelayClient],
+    maybe_mux_id: Option<&str>,
+    send_headers: HeaderMap,
+) -> Vec<impl Future<Output = Result<Option<GetHeaderResponse>, PbsError>>> {
+    let ms_into_slot = ms_into_slot(params.slot, state.config.chain);
+
+    if let Some(mux_id) = maybe_mux_id {
+        debug!(mux_id, relays = relays.len(), pubkey = %params.pubkey, "using mux config");
+    } else {
+        debug!(relays = relays.len(), pubkey = %params.pubkey, "using default config");
+    }
+
+    let max_timeout_ms = pbs_config
+        .timeout_get_header_ms
+        .min(pbs_config.late_in_slot_time_ms.saturating_sub(ms_into_slot));
+
+    if max_timeout_ms == 0 {
+        warn!(
+            ms_into_slot,
+            threshold = pbs_config.late_in_slot_time_ms,
+            "late in slot, skipping relay requests"
+        );
+
+        return vec![];
+    }
+
+    let mut handles = Vec::with_capacity(relays.len());
+    for relay in relays.iter() {
+        handles.push(send_timed_get_header(
+            params,
+            relay.clone(),
+            state.config.chain,
+            send_headers.clone(),
+            ms_into_slot,
+            max_timeout_ms,
+            ValidationContext {
+                skip_sigverify: state.pbs_config().skip_sigverify,
+                min_bid_wei: state.pbs_config().min_bid_wei,
+                extra_validation_enabled: state.extra_validation_enabled(),
+                parent_block: parent_block.clone(),
+            },
+        ));
+    }
+
+    handles
 }
 
 /// Fetch the parent block from the RPC URL for extra validation of the header.
